@@ -149,9 +149,9 @@ enum Sender {
         fh.seek(toFileOffset: UInt64(offset))
         var remaining = length
         while remaining > 0 {
-            let chunk = fh.readData(ofLength: Int(min(remaining, 1 << 20)))
+            let chunk = fh.readData(ofLength: Int(min(remaining, 256 << 10)))   // 小块发：慢网络下每块也能很快确认
             guard !chunk.isEmpty else { throw PortalError.remote("\(name) 在发送过程中被改动了") }
-            try await conn.sendAsync(chunk)
+            try await conn.sendAsync(chunk, timeout: 120)
             remaining -= Int64(chunk.count)
             progress?(Int64(chunk.count))
         }

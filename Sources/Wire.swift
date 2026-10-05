@@ -12,7 +12,7 @@ enum PortalError: LocalizedError {
         switch self {
         case .closed: return "连接断开"
         case .timeout: return "连接超时"
-        case .stalled: return "网络卡住了（60 秒没有进展）"
+        case .stalled: return "网络卡住了（2 分钟没有进展）"
         case .badFrame: return "数据格式不对"
         case .remote(let m): return m
         }
@@ -118,7 +118,7 @@ extension NWConnection {
     }
 
     /// 接收；timeout 秒内一个字节都没收到就断开（nil = 不限时）
-    func receiveAsync(max: Int, timeout: TimeInterval? = 60) async throws -> Data {
+    func receiveAsync(max: Int, timeout: TimeInterval? = 120) async throws -> Data {
         try await withCheckedThrowingContinuation { c in
             let once = Once()
             receive(minimumIncompleteLength: 1, maximumLength: max) { data, _, _, error in

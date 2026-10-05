@@ -51,6 +51,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
             if mode == "drop" { NSWorkspace.shared.activateFileViewerSelecting(urls) }
         }
         server.onProgress = { st in self.showProgress(st, receiving: true) }
+        cleanInbox()
         Links.shared.server = server
         Links.shared.onChange = { self.refresh() }
         do { try server.start(port: Store.shared.config.port) } catch {
@@ -149,6 +150,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
         }
     }
 
+    /// 清理中断传输留下的临时文件夹，以及旧版本误同步过来的 UU 占位文件
+    private func cleanInbox() {
+        let dir = Store.shared.config.recvURL
+        let fm = FileManager.default
+        for name in (try? fm.contentsOfDirectory(atPath: dir.path)) ?? []
+        where name.hasPrefix(".incoming-") || name.hasPrefix(".uuremote") {
+            try? fm.removeItem(at: dir.appendingPathComponent(name))
+        }
+    }
+
     private func markClipboardSeen() {
         lastChange = NSPasteboard.general.changeCount
         seenChange = lastChange
@@ -166,6 +177,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
         var ok: [String] = []
         var failed: [String] = []
         for p in targets {
+            log("开始发送 \(name)（\(formatBytes(size))）到 \(p.display)")
             do {
                 let peerName = try await Sender.sendFiles(urls, to: p.address, mode: mode, peerVersion: p.version) { n in
                     let sent = counter.add(n)
@@ -175,6 +187,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
                     }
                 }
                 ok.append(peerName)
+                log("已发送 \(name) 到 \(peerName)")
             } catch {
                 log("发送到 \(p.display) 失败：\(error.localizedDescription)")
                 failed.append("\(p.display)（\(error.localizedDescription)）")
