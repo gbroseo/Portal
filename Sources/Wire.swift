@@ -34,17 +34,26 @@ struct Header: Codable {
     var v = 1
     var key: String
     var from: String
-    var kind: String          // ping | clip | files
-    var mode: String?         // clip（复制同步）| drop（主动发送）
+    var kind: String          // ping | clip | files | link | callback | reverse | keepalive | diag | clipinfo | simulate
+    var mode: String?         // clip（复制同步）| drop（主动发送）；simulate 时为 text / image / file
     var reps: [Rep]?
     var files: [FileEntry]?
+    var id: String?           // 反向连接的编号
+    var text: String?
+    var size: Int64?
 }
 
 struct Reply: Codable {
     var ok: Bool
     var error: String?
     var name: String?
+    var version: String?
+    var known: [String]?      // 对方知道的其他电脑（Tailscale 地址），互相分享
+    var info: String?
 }
+
+/// 测试开关：模拟「这台电脑连不出去」
+let testNoDial = ProcessInfo.processInfo.environment["PORTAL_TEST_NODIAL"] != nil
 
 let netQueue = DispatchQueue(label: "portal.net")
 let chunkSize = 4 << 20
@@ -63,6 +72,7 @@ final class Once: @unchecked Sendable {
 
 extension NWConnection {
     static func open(_ address: String, defaultPort: UInt16, timeout: TimeInterval = 5) async throws -> NWConnection {
+        if testNoDial { throw PortalError.remote("测试：禁止主动连接") }
         var host = address
         var port = defaultPort
         if address.filter({ $0 == ":" }).count == 1, let i = address.lastIndex(of: ":"),

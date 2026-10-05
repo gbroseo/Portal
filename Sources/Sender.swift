@@ -3,9 +3,20 @@ import Network
 
 /// 发送端：把剪贴板内容或文件推给一台电脑。
 enum Sender {
+    /// 先直接连；连不上但对方正连着本机时，请它反向连过来
+    static func connect(_ address: String, timeout: TimeInterval = 5) async throws -> NWConnection {
+        do {
+            return try await NWConnection.open(address, defaultPort: Store.shared.config.port, timeout: timeout)
+        } catch {
+            let ip = hostOf(address)
+            guard Links.shared.hasIncoming(ip) else { throw error }
+            return try await Links.shared.requestCallback(ip)
+        }
+    }
+
     static func sendClip(_ reps: [(Rep, Data)], to address: String) async throws -> String {
         let cfg = Store.shared.config
-        let conn = try await NWConnection.open(address, defaultPort: cfg.port)
+        let conn = try await connect(address)
         defer { conn.cancel() }
         try await conn.writeFrame(Header(key: cfg.key, from: computerName, kind: "clip", mode: "clip",
                                          reps: reps.map(\.0)))
@@ -52,7 +63,7 @@ enum Sender {
                           progress: ((Int64) -> Void)? = nil) async throws -> String {
         let cfg = Store.shared.config
         let items = try plan(urls)
-        let conn = try await NWConnection.open(address, defaultPort: cfg.port)
+        let conn = try await connect(address)
         defer { conn.cancel() }
         try await conn.writeFrame(Header(key: cfg.key, from: computerName, kind: "files", mode: mode,
                                          files: items.map(\.0)))

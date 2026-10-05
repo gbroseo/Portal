@@ -9,6 +9,7 @@ enum CLI {
       portal peers                                列出能连上的电脑
       portal key [新配对码]                        查看 / 设置本机配对码
       portal diag                                 诊断信息
+      portal remote <地址> diag|clip              查看另一台的诊断 / 剪贴板（测试用）
       （send / text 可加 --host IP 直接指定对方地址）
     """
 
@@ -35,10 +36,10 @@ enum CLI {
                 let s: String
                 switch p.state {
                 case .online: s = "已连接"
-                case .wrongKey: s = "配对码不一致"
+                case .wrongKey: s = "对方版本太旧，请更新"
                 case .offline: s = "未运行传送门"
                 }
-                print("\(p.display)\t\(p.address)\t\(s)")
+                print("\(p.display)\t\(p.address)\t\(s)\tv\(p.version ?? "?")")
             }
             return 0
 
@@ -96,17 +97,34 @@ enum CLI {
             return code
 
         case "diag":
-            let cfg = Store.shared.config
-            let info = ProcessInfo.processInfo
-            print("电脑：\(computerName)  系统：\(info.operatingSystemVersionString)")
-            print("传送门：\(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") ?? "?")  端口：\(cfg.port)  配对码：\(cfg.key)")
-            print("手动地址：\(cfg.peers)  记住的电脑：\(cfg.learned)")
-            print("Tailscale 命令行：\(Peers.tailscaleCLI ?? "未找到")")
-            let ts = Peers.tailscalePeers()
-            print("Tailscale 同账号在线设备：\(ts.map { "\($0.label) \($0.address)" })")
-            if let e = Peers.lastError { print("Tailscale 错误：\(e)") }
-            for p in await Peers.scan() { print("连接测试：\(p.display) \(p.address) \(p.state)") }
+            print(await Diag.text())
             return 0
+
+        case "remote":
+            // portal remote <地址> diag | clip | copy <文字> | copyimage | copyfile <MB>
+            guard rest.count >= 2 else { err("用法：portal remote <地址> diag|clip|copy 文字|copyimage|copyfile MB"); return 1 }
+            let cfg = Store.shared.config
+            var h = Header(key: cfg.key, from: computerName, kind: "diag")
+            switch rest[1] {
+            case "diag": break
+            case "clip": h.kind = "clipinfo"
+            case "copy": h.kind = "simulate"; h.mode = "text"; h.text = rest.dropFirst(2).joined(separator: " ")
+            case "copyimage": h.kind = "simulate"; h.mode = "image"; h.text = rest.dropFirst(2).joined(separator: " ")
+            case "copyfile": h.kind = "simulate"; h.mode = "file"; h.size = Int64(rest.count > 2 ? rest[2] : "1") ?? 1
+            default: err("未知操作 \(rest[1])"); return 1
+            }
+            do {
+                let conn = try await Sender.connect(rest[0])
+                defer { conn.cancel() }
+                try await conn.writeFrame(h)
+                let r = try await conn.readFrame(Reply.self)
+                print("[\(r.name ?? "?") v\(r.version ?? "?")] ok=\(r.ok) \(r.error ?? "")")
+                if let info = r.info { print(info) }
+                return r.ok ? 0 : 1
+            } catch {
+                err("\(error.localizedDescription)")
+                return 1
+            }
 
         default:
             print(usage)

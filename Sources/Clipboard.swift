@@ -1,4 +1,5 @@
 import AppKit
+import CryptoKit
 
 /// 读取 / 写入系统剪贴板。会完整复制每一种格式（纯文本、富文本、HTML、图片……），粘贴效果和本机复制一样。
 enum Clipboard {
@@ -76,6 +77,64 @@ enum Clipboard {
             return "文字「\(t.count > 18 ? String(t.prefix(18)) + "…" : t)」"
         }
         return "剪贴板内容"
+    }
+}
+
+
+extension Clipboard {
+    /// 远程测试用：当前剪贴板的类型、文字摘要和文件名（不传图片内容）
+    static func info() -> String {
+        let pb = NSPasteboard.general
+        let types = (pb.types ?? []).map(\.rawValue)
+        var parts = ["types=\(types.filter { !$0.hasPrefix("dyn.") && !$0.contains(" ") })"]
+        if let s = pb.string(forType: .string) { parts.append("text=\(s.prefix(60))") }
+        if let png = pb.data(forType: .png) ?? pb.data(forType: .tiff) {
+            let digest = SHA256.hash(data: png).map { String(format: "%02x", $0) }.joined().prefix(12)
+            parts.append("image=\(png.count)B sha=\(digest)")
+        }
+        if let urls = pb.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL], !urls.isEmpty {
+            parts.append("files=\(urls.map(\.lastPathComponent))")
+        }
+        return parts.joined(separator: " ")
+    }
+
+    /// 远程测试用：在本机模拟一次复制（不带传送门标记，所以会被自动同步出去）
+    static func simulateCopy(_ kind: String, text: String?, size: Int64) throws -> String {
+        let pb = NSPasteboard.general
+        switch kind {
+        case "image":
+            let img = NSImage(size: NSSize(width: 320, height: 180), flipped: false) { r in
+                NSColor.systemTeal.setFill(); r.fill()
+                ("传送门测试 " + (text ?? "")).draw(at: NSPoint(x: 20, y: 80),
+                    withAttributes: [.font: NSFont.boldSystemFont(ofSize: 22), .foregroundColor: NSColor.white])
+                return true
+            }
+            guard let tiff = img.tiffRepresentation, let png = NSBitmapImageRep(data: tiff)?.representation(using: .png, properties: [:])
+            else { throw PortalError.badFrame }
+            pb.clearContents()
+            pb.setData(png, forType: .png)
+            let digest = SHA256.hash(data: png).map { String(format: "%02x", $0) }.joined().prefix(12)
+            return "image=\(png.count)B sha=\(digest)"
+        case "file":
+            let mb = max(1, min(size, 1024))
+            let url = FileManager.default.temporaryDirectory.appendingPathComponent("传送门测试-\(mb)MB.bin")
+            FileManager.default.createFile(atPath: url.path, contents: nil)
+            let fh = try FileHandle(forWritingTo: url)
+            var chunk = Data(count: 1 << 20)
+            for i in 0..<Int(mb) {
+                chunk.withUnsafeMutableBytes { _ = SecRandomCopyBytes(kSecRandomDefault, 4096, $0.baseAddress!) }
+                chunk[0] = UInt8(i & 0xff)
+                fh.write(chunk)
+            }
+            fh.closeFile()
+            pb.clearContents()
+            pb.writeObjects([url as NSURL])
+            return "file=\(url.lastPathComponent)"
+        default:
+            pb.clearContents()
+            pb.setString(text ?? "传送门测试", forType: .string)
+            return "text=\(text ?? "")"
+        }
     }
 }
 

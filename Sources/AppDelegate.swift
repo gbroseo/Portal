@@ -48,6 +48,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
             if mode == "drop" { NSWorkspace.shared.activateFileViewerSelecting(urls) }
         }
         server.onProgress = { frac in self.showProgress(frac, receiving: true) }
+        Links.shared.server = server
+        Links.shared.onChange = { self.refresh() }
         do { try server.start(port: Store.shared.config.port) } catch {
             HUD.show("⚠️ 传送门启动失败：\(error.localizedDescription)", seconds: 6)
         }
@@ -69,6 +71,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
             await MainActor.run {
                 let before = self.online.map(\.address)
                 self.peers = found
+                // 对每台能连上的电脑保持一条长连接，对方连不过来时靠它反向连接
+                Links.shared.maintain(found.filter { $0.state == .online }.map(\.address))
                 self.scanning = false
                 let after = self.online.map(\.address)
                 if before != after { log("在线电脑：\(self.online.map(\.display))") }
@@ -217,14 +221,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
         menu.addItem(disabled("传送门 · 本机：\(computerName)"))
         menu.addItem(.separator())
 
-        if peers.isEmpty {
-            menu.addItem(disabled(Peers.tailscaleCLI == nil ? "未检测到 Tailscale，请先安装并登录" : "还没发现其他电脑"))
+        // 只显示有名字的离线设备（Tailscale 列表里的），记住的旧地址离线时不显示
+        let shown = peers.filter { $0.state != .offline || $0.label != $0.address }
+        if shown.isEmpty {
+            menu.addItem(disabled(myTailnetIP() == nil ? "Tailscale 未连接，请打开 Tailscale 并登录" : "正在寻找其他电脑…"))
+            menu.addItem(disabled("（另一台也要打开传送门和 Tailscale，用同一个账号）"))
         }
-        for p in peers {
+        for p in shown {
             switch p.state {
             case .online: menu.addItem(disabled("🟢 \(p.display)  已连接"))
-            case .wrongKey: menu.addItem(disabled("🟠 \(p.display)  配对码不一致"))
-            case .offline: menu.addItem(disabled("⚪️ \(p.label)  未运行传送门"))
+            case .wrongKey: menu.addItem(disabled("🟠 \(p.display)  传送门版本太旧，请在那台更新"))
+            case .offline: menu.addItem(disabled("⚪️ \(p.label)  未打开传送门"))
             }
         }
         menu.addItem(item("刷新", #selector(refreshClicked)))
@@ -240,9 +247,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
         menu.addItem(ball)
         menu.addItem(.separator())
 
-        menu.addItem(item("复制本机配对码：\(cfg.key)", #selector(copyKey)))
-        menu.addItem(item("输入另一台的配对码…", #selector(enterKey)))
-        menu.addItem(item("手动添加电脑地址…", #selector(addPeer)))
+        // 同一 Tailscale 账号的电脑自动连接；配对码只在不用 Tailscale、走局域网时才需要
+        let advanced = NSMenu()
+        advanced.addItem(item("复制本机配对码：\(cfg.key)", #selector(copyKey)))
+        advanced.addItem(item("输入另一台的配对码…", #selector(enterKey)))
+        advanced.addItem(item("手动添加电脑地址…", #selector(addPeer)))
+        advanced.addItem(.separator())
+        advanced.addItem(disabled("版本 \(appVersion)"))
+        let adv = NSMenuItem(title: "高级（局域网配对，一般用不到）", action: nil, keyEquivalent: "")
+        adv.submenu = advanced
+        menu.addItem(adv)
         if #available(macOS 13.0, *) {
             let login = item("开机自动启动", #selector(toggleLogin))
             login.state = SMAppService.mainApp.status == .enabled ? .on : .off

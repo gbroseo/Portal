@@ -21,8 +21,8 @@ final class Server {
             }
             conn.start(queue: netQueue)
             Task {
-                await self?.handle(conn, ip: ip)
-                conn.cancel()
+                let keep = await self?.handle(conn, ip: ip) ?? false
+                if !keep { conn.cancel() }
             }
         }
         l.stateUpdateHandler = { state in
@@ -57,26 +57,45 @@ final class Server {
             || (o[0] == 169 && o[1] == 254)
     }
 
+    /// Tailscale 地址连进来的一律信任（只有同一账号的设备能连到这些地址）；局域网地址才需要配对码。
     private func authorized(_ h: Header, ip: String) -> Bool {
-        if Config.normalize(h.key) == Config.normalize(Store.shared.config.key) { return true }
-        if Peers.isTrusted(ip) { return true }
-        // 新设备刚加入 Tailscale 时信任列表可能还没刷新，再查一次
-        _ = Peers.tailscalePeers()
-        return Peers.isTrusted(ip)
+        isTailnet(ip) || isLoopback(ip) || Config.normalize(h.key) == Config.normalize(Store.shared.config.key)
     }
 
-    private func handle(_ conn: NWConnection, ip: String) async {
+    private func ok(_ info: String? = nil) -> Reply {
+        Reply(ok: true, name: computerName, version: appVersion, known: Peers.knownAddresses(), info: info)
+    }
+
+    /// 处理一条连接上的请求。返回 true 表示这条连接要保留（长连接 / 反向连接）。
+    @discardableResult
+    func handle(_ conn: NWConnection, ip: String) async -> Bool {
         do {
             let h = try await conn.readFrame(Header.self)
             guard authorized(h, ip: ip) else {
                 log("配对码不一致，拒绝 \(h.from) (\(ip))")
-                try await conn.writeFrame(Reply(ok: false, error: "配对码不一致", name: computerName))
-                return
+                try await conn.writeFrame(Reply(ok: false, error: "配对码不一致", name: computerName, version: appVersion))
+                return false
             }
-            Peers.learn(ip)
+            if !isLoopback(ip) { Peers.learn(ip) }
+            let testable = isTailnet(ip) || isLoopback(ip)
             switch h.kind {
             case "ping":
-                try await conn.writeFrame(Reply(ok: true, name: computerName))
+                try await conn.writeFrame(ok())
+            case "link":
+                try await conn.writeFrame(ok())
+                Links.shared.registerIncoming(ip, conn)
+                return true
+            case "reverse":
+                if let id = h.id, Links.shared.fulfil(id, conn) { return true }
+            case "diag" where testable:
+                try await conn.writeFrame(ok(await Diag.text()))
+            case "clipinfo" where testable:
+                let info = await MainActor.run { Clipboard.info() }
+                try await conn.writeFrame(ok(info))
+            case "simulate" where testable:
+                // 远程测试：在本机模拟一次「复制」，看能不能自动同步出去
+                let info = try await MainActor.run { try Clipboard.simulateCopy(h.mode ?? "text", text: h.text, size: h.size ?? 1) }
+                try await conn.writeFrame(ok(info))
             case "clip":
                 var items: [(Rep, Data)] = []
                 for r in h.reps ?? [] {
@@ -86,12 +105,12 @@ final class Server {
                 log("收到 \(h.from) 的剪贴板（\(items.count) 项，\(items.reduce(0) { $0 + $1.1.count }) 字节）")
                 let received = items
                 await MainActor.run { onClip?(received, h.from) }
-                try await conn.writeFrame(Reply(ok: true, name: computerName))
+                try await conn.writeFrame(ok())
             case "files":
                 let urls = try await receiveFiles(h.files ?? [], conn)
                 log("收到 \(h.from) 的 \(urls.count) 个项目：\(urls.map(\.lastPathComponent))")
                 await MainActor.run { onFiles?(urls, h.from, h.mode ?? "drop") }
-                try await conn.writeFrame(Reply(ok: true, name: computerName))
+                try await conn.writeFrame(ok())
             default:
                 try await conn.writeFrame(Reply(ok: false, error: "不支持的请求 \(h.kind)", name: computerName))
             }
@@ -99,6 +118,7 @@ final class Server {
             log("处理连接出错：\(error.localizedDescription)")
             await MainActor.run { onProgress?(nil) }
         }
+        return false
     }
 
     private func receiveFiles(_ files: [FileEntry], _ conn: NWConnection) async throws -> [URL] {
