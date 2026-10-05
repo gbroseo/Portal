@@ -13,6 +13,7 @@ final class FloatingPortal: NSView {
     var progressText: String? { didSet { needsDisplay = true } }
 
     static let size: CGFloat = 52
+    static let defaultTip = "传送门：把文件拖到这里发送到另一台电脑；点一下打开菜单"
 
     init() {
         let s = FloatingPortal.size
@@ -26,7 +27,7 @@ final class FloatingPortal: NSView {
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
         panel.contentView = self
         registerForDraggedTypes([.fileURL])
-        toolTip = "传送门：把文件拖到这里发送到另一台电脑；点一下打开菜单"
+        toolTip = FloatingPortal.defaultTip
 
         let saved = UserDefaults.standard.string(forKey: "floatOrigin").map(NSPointFromString)
         let screen = NSScreen.main ?? NSScreen.screens[0]

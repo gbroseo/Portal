@@ -1,13 +1,38 @@
 import Foundation
 import Network
 
+/// 传输进度（接收或发送）
+struct TransferStatus {
+    var receiving: Bool
+    var name: String
+    var done: Int64
+    var total: Int64
+}
+
 /// 接收端：监听端口，接收剪贴板内容和文件。
 final class Server {
     var listener: NWListener?
-    /// 收到东西后在主线程回调：文字说明 + 内容
+    /// 收到东西后在主线程回调
     var onClip: (([(Rep, Data)], String) -> Void)?
     var onFiles: (([URL], String, String) -> Void)?   // urls, from, mode
-    var onProgress: ((Double?) -> Void)?
+    var onProgress: ((TransferStatus?) -> Void)?
+
+    /// 正在接收的分段传输
+    private final class Incoming {
+        let staging: URL
+        let name: String
+        let total: Int64
+        var done: Int64 = 0
+        var remaining: Int64          // 还没收到的分段字节数
+        var lastProgress = Date()
+        var waiter: CheckedContinuation<Void, Error>?
+        init(staging: URL, name: String, total: Int64, remaining: Int64) {
+            self.staging = staging; self.name = name; self.total = total; self.remaining = remaining
+        }
+    }
+    private let lock = NSLock()
+    private var transfers: [String: Incoming] = [:]
+    private var lastReport = Date.distantPast
 
     func start(port: UInt16) throws {
         let params = NWParameters.tcp
@@ -66,6 +91,11 @@ final class Server {
         Reply(ok: true, name: computerName, version: appVersion, known: Peers.knownAddresses(), info: info)
     }
 
+    func deliverClip(_ items: [(Rep, Data)], from: String) async {
+        log("收到 \(from) 的剪贴板（\(items.count) 项，\(items.reduce(0) { $0 + $1.1.count }) 字节）")
+        await MainActor.run { onClip?(items, from) }
+    }
+
     /// 处理一条连接上的请求。返回 true 表示这条连接要保留（长连接 / 反向连接）。
     @discardableResult
     func handle(_ conn: NWConnection, ip: String) async -> Bool {
@@ -83,7 +113,7 @@ final class Server {
                 try await conn.writeFrame(ok())
             case "link":
                 try await conn.writeFrame(ok())
-                Links.shared.registerIncoming(ip, conn)
+                Links.shared.registerIncoming(ip, conn, name: h.from, version: h.ver)
                 return true
             case "reverse":
                 if let id = h.id, Links.shared.fulfil(id, conn) { return true }
@@ -102,74 +132,168 @@ final class Server {
                     guard r.size >= 0, r.size < 512 << 20, (0..<10_000).contains(r.item) else { throw PortalError.badFrame }
                     items.append((r, try await conn.readExactly(r.size)))
                 }
-                log("收到 \(h.from) 的剪贴板（\(items.count) 项，\(items.reduce(0) { $0 + $1.1.count }) 字节）")
-                let received = items
-                await MainActor.run { onClip?(received, h.from) }
+                await deliverClip(items, from: h.from)
                 try await conn.writeFrame(ok())
             case "files":
-                let urls = try await receiveFiles(h.files ?? [], conn)
+                let urls = try await receiveFiles(h, conn)
                 log("收到 \(h.from) 的 \(urls.count) 个项目：\(urls.map(\.lastPathComponent))")
                 await MainActor.run { onFiles?(urls, h.from, h.mode ?? "drop") }
                 try await conn.writeFrame(ok())
+            case "part":
+                // 一条并行连接上会依次发来多个分段
+                var cur = h
+                while true {
+                    try await receivePart(cur, conn)
+                    try await conn.writeFrame(Reply(ok: true))
+                    guard let next = try? await conn.readFrame(Header.self, timeout: 120), next.kind == "part" else { break }
+                    cur = next
+                }
             default:
                 try await conn.writeFrame(Reply(ok: false, error: "不支持的请求 \(h.kind)", name: computerName))
             }
         } catch {
             log("处理连接出错：\(error.localizedDescription)")
-            await MainActor.run { onProgress?(nil) }
         }
         return false
     }
 
-    private func receiveFiles(_ files: [FileEntry], _ conn: NWConnection) async throws -> [URL] {
+    // MARK: 接收文件
+
+    private func receiveFiles(_ h: Header, _ conn: NWConnection) async throws -> [URL] {
+        let files = h.files ?? []
         let fm = FileManager.default
         let dest = Store.shared.config.recvURL
         let staging = dest.appendingPathComponent(".incoming-\(UUID().uuidString)")
         try fm.createDirectory(at: staging, withIntermediateDirectories: true)
         defer { try? fm.removeItem(at: staging) }
 
-        let total = max(files.reduce(Int64(0)) { $0 + $1.size }, 1)
-        var done: Int64 = 0
-        var lastReport = Date.distantPast
+        // 第一遍：检查路径、建目录、给分段传输的大文件预留空间
         var tops: [String] = []
-
+        var splitBytes: Int64 = 0
         for f in files {
-            let parts = f.path.split(separator: "/").map(String.init)
-            guard !parts.isEmpty, !f.path.hasPrefix("/"), !parts.contains(".."), !parts.contains("."), f.size >= 0 else {
-                throw PortalError.badFrame
-            }
-            if !tops.contains(parts[0]) { tops.append(parts[0]) }
-            let url = staging.appendingPathComponent(parts.joined(separator: "/"))
+            let url = try Server.safeURL(staging, f.path)
+            let top = String(f.path.split(separator: "/")[0])
+            if !tops.contains(top) { tops.append(top) }
             if f.dir {
                 try fm.createDirectory(at: url, withIntermediateDirectories: true)
-                continue
+            } else if f.split == true {
+                try fm.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+                fm.createFile(atPath: url.path, contents: nil)
+                let fh = try FileHandle(forWritingTo: url)
+                fh.truncateFile(atOffset: UInt64(f.size))
+                fh.closeFile()
+                splitBytes += f.size
             }
+        }
+        let total = max(files.reduce(Int64(0)) { $0 + $1.size }, 1)
+        let name = tops.count == 1 ? tops[0] : "\(tops.count) 个项目"
+        let tid = h.tid ?? UUID().uuidString
+        let t = Incoming(staging: staging, name: name, total: total, remaining: splitBytes)
+        lock.lock(); transfers[tid] = t; lock.unlock()
+        defer {
+            lock.lock(); transfers[tid] = nil; lock.unlock()
+            report(nil)
+        }
+
+        // 第二遍：小文件内容直接跟在这条连接后面
+        for f in files where !f.dir && f.split != true {
+            let url = try Server.safeURL(staging, f.path)
             try fm.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
             fm.createFile(atPath: url.path, contents: nil)
             let fh = try FileHandle(forWritingTo: url)
+            defer { fh.closeFile() }
             var remaining = f.size
             while remaining > 0 {
                 let chunk = try await conn.receiveAsync(max: Int(min(remaining, Int64(chunkSize))))
                 fh.write(chunk)
                 remaining -= Int64(chunk.count)
-                done += Int64(chunk.count)
-                if total > 8 << 20, Date().timeIntervalSince(lastReport) > 0.3 {
-                    lastReport = Date()
-                    let frac = Double(done) / Double(total)
-                    await MainActor.run { onProgress?(frac) }
+                progress(t, Int64(chunk.count))
+            }
+        }
+
+        // 等并行分段全部到齐（90 秒没有任何进展就放弃）
+        if splitBytes > 0 {
+            log("\(name)：大文件分段并行接收（\(formatBytes(splitBytes))）")
+            let watchdog = Task.detached { [weak self] in
+                while !Task.isCancelled {
+                    try? await Task.sleep(nanoseconds: 5_000_000_000)
+                    guard let self else { return }
+                    self.lock.lock()
+                    let stalled = Date().timeIntervalSince(t.lastProgress) > 90
+                    let w = stalled ? t.waiter : nil
+                    if stalled { t.waiter = nil }
+                    self.lock.unlock()
+                    if let w { w.resume(throwing: PortalError.stalled); return }
                 }
             }
-            fh.closeFile()
+            defer { watchdog.cancel() }
+            try await withCheckedThrowingContinuation { (c: CheckedContinuation<Void, Error>) in
+                lock.lock()
+                if t.remaining <= 0 { lock.unlock(); c.resume() } else { t.waiter = c; lock.unlock() }
+            }
         }
-        await MainActor.run { onProgress?(nil) }
 
         var result: [URL] = []
-        for t in tops {
-            let target = Server.unique(dest.appendingPathComponent(t))
-            try fm.moveItem(at: staging.appendingPathComponent(t), to: target)
+        for top in tops {
+            let target = Server.unique(dest.appendingPathComponent(top))
+            try fm.moveItem(at: staging.appendingPathComponent(top), to: target)
             result.append(target)
         }
         return result
+    }
+
+    private func receivePart(_ h: Header, _ conn: NWConnection) async throws {
+        // 分段可能比主连接的文件清单先到，稍等一下
+        var found: Incoming?
+        for _ in 0..<100 {
+            lock.lock(); found = h.tid.flatMap { transfers[$0] }; lock.unlock()
+            if found != nil { break }
+            try await Task.sleep(nanoseconds: 100_000_000)
+        }
+        guard let t = found, let path = h.text, let offset = h.offset, let size = h.size, offset >= 0, size >= 0 else {
+            throw PortalError.badFrame
+        }
+        let url = try Server.safeURL(t.staging, path)
+        let fh = try FileHandle(forWritingTo: url)
+        defer { fh.closeFile() }
+        fh.seek(toFileOffset: UInt64(offset))
+        var remaining = size
+        while remaining > 0 {
+            let chunk = try await conn.receiveAsync(max: Int(min(remaining, Int64(chunkSize))))
+            fh.write(chunk)
+            remaining -= Int64(chunk.count)
+            progress(t, Int64(chunk.count))
+        }
+        lock.lock()
+        t.remaining -= size
+        let w = t.remaining <= 0 ? t.waiter : nil
+        if w != nil { t.waiter = nil }
+        lock.unlock()
+        w?.resume()
+    }
+
+    private func progress(_ t: Incoming, _ n: Int64) {
+        lock.lock()
+        t.done += n
+        t.lastProgress = Date()
+        let due = t.total > 4 << 20 && Date().timeIntervalSince(lastReport) > 0.25
+        if due { lastReport = Date() }
+        let status = TransferStatus(receiving: true, name: t.name, done: t.done, total: t.total)
+        lock.unlock()
+        if due { report(status) }
+    }
+
+    private func report(_ s: TransferStatus?) {
+        DispatchQueue.main.async { self.onProgress?(s) }
+    }
+
+    /// 对方给的相对路径必须留在目标文件夹里
+    static func safeURL(_ base: URL, _ path: String) throws -> URL {
+        let parts = path.split(separator: "/").map(String.init)
+        guard !parts.isEmpty, !path.hasPrefix("/"), !parts.contains(".."), !parts.contains(".") else {
+            throw PortalError.badFrame
+        }
+        return base.appendingPathComponent(parts.joined(separator: "/"))
     }
 
     /// 重名时改成「名字 2.扩展名」

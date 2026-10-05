@@ -76,13 +76,12 @@ enum CLI {
             var code: Int32 = 0
             for p in targets {
                 let start = Date()
-                var sent: Int64 = 0
-                var last = Date.distantPast
+                let throttle = Throttle(0.5)
                 do {
-                    let name = try await Sender.sendFiles(urls, to: p.address, mode: "drop") { n in
-                        sent += n
-                        if Date().timeIntervalSince(last) > 0.5 {
-                            last = Date()
+                    let counter = Counter()
+                    let name = try await Sender.sendFiles(urls, to: p.address, mode: "drop", peerVersion: p.version) { n in
+                        let sent = counter.add(n)
+                        if throttle.due() {
                             err(String(format: "\r→ %@  %3.0f%%  %@/s", p.display, Double(sent) / Double(max(size, 1)) * 100,
                                        formatBytes(Int64(Double(sent) / max(Date().timeIntervalSince(start), 0.001)))))
                         }

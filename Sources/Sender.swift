@@ -3,8 +3,12 @@ import Network
 
 /// 发送端：把剪贴板内容或文件推给一台电脑。
 enum Sender {
+    /// 大于这个大小的文件分段、多条连接并行发送（高延迟或丢包的网络上快很多）
+    static let splitThreshold: Int64 = 16 << 20
+    static let segmentSize: Int64 = 8 << 20
+
     /// 先直接连；连不上但对方正连着本机时，请它反向连过来
-    static func connect(_ address: String, timeout: TimeInterval = 5) async throws -> NWConnection {
+    static func connect(_ address: String, timeout: TimeInterval = 15) async throws -> NWConnection {
         do {
             return try await NWConnection.open(address, defaultPort: Store.shared.config.port, timeout: timeout)
         } catch {
@@ -16,11 +20,15 @@ enum Sender {
 
     static func sendClip(_ reps: [(Rep, Data)], to address: String) async throws -> String {
         let cfg = Store.shared.config
+        let header = Header(key: cfg.key, from: computerName, kind: "clip", mode: "clip", reps: reps.map(\.0))
+        // 有长连接就直接从长连接发，省掉建立连接的往返，复制后几乎马上到
+        if let l = Links.shared.linked(address), versionAtLeast(l.version, "1.2.0"),
+           await Links.shared.send(to: address, try NWConnection.frameData(header, payload: reps.map(\.1))) {
+            return l.name
+        }
         let conn = try await connect(address)
         defer { conn.cancel() }
-        try await conn.writeFrame(Header(key: cfg.key, from: computerName, kind: "clip", mode: "clip",
-                                         reps: reps.map(\.0)))
-        for (_, data) in reps where !data.isEmpty { try await conn.sendAsync(data) }
+        try await conn.sendAsync(try NWConnection.frameData(header, payload: reps.map(\.1)))
         let r = try await conn.readFrame(Reply.self)
         guard r.ok else { throw PortalError.remote(r.error ?? "对方拒绝") }
         return r.name ?? address
@@ -59,29 +67,125 @@ enum Sender {
         ((try? plan(urls)) ?? []).reduce(0) { $0 + $1.0.size }
     }
 
-    static func sendFiles(_ urls: [URL], to address: String, mode: String,
-                          progress: ((Int64) -> Void)? = nil) async throws -> String {
+    private struct Segment {
+        var path: String
+        var src: URL
+        var offset: Int64
+        var length: Int64
+    }
+
+    private actor SegmentQueue {
+        var items: [Segment]
+        init(_ items: [Segment]) { self.items = items }
+        func next() -> Segment? { items.isEmpty ? nil : items.removeFirst() }
+    }
+
+    /// progress 会从多个并行连接同时调用，调用方要自己保证线程安全
+    static func sendFiles(_ urls: [URL], to address: String, mode: String, peerVersion knownVersion: String? = nil,
+                          progress: (@Sendable (Int64) -> Void)? = nil) async throws -> String {
         let cfg = Store.shared.config
-        let items = try plan(urls)
+        var items = try plan(urls)
+        // 对方是 1.2.0 以上才支持分段并行
+        let peerVersion = knownVersion ?? Links.shared.linked(address)?.version
+        let streams = versionAtLeast(peerVersion, "1.2.0") ? max(1, cfg.streams) : 1
+        if streams > 1 {
+            for i in items.indices where !items[i].0.dir && items[i].0.size >= splitThreshold { items[i].0.split = true }
+        }
+        var segments: [Segment] = []
+        for (e, src) in items where e.split == true {
+            guard let src else { continue }
+            var off: Int64 = 0
+            while off < e.size {
+                segments.append(Segment(path: e.path, src: src, offset: off, length: min(segmentSize, e.size - off)))
+                off += segmentSize
+            }
+        }
+
+        let tid = UUID().uuidString
         let conn = try await connect(address)
         defer { conn.cancel() }
         try await conn.writeFrame(Header(key: cfg.key, from: computerName, kind: "files", mode: mode,
-                                         files: items.map(\.0)))
-        for (entry, src) in items {
-            guard let src, !entry.dir else { continue }
-            let fh = try FileHandle(forReadingFrom: src)
-            defer { fh.closeFile() }
-            var remaining = entry.size
-            while remaining > 0 {
-                let chunk = fh.readData(ofLength: Int(min(remaining, Int64(chunkSize))))
-                guard !chunk.isEmpty else { throw PortalError.remote("\(entry.path) 在发送过程中被改动了") }
-                try await conn.sendAsync(chunk)
-                remaining -= Int64(chunk.count)
-                progress?(Int64(chunk.count))
-            }
+                                         files: items.map(\.0), tid: tid))
+
+        // 大文件分段，同时用多条连接发；小文件跟在主连接后面
+        async let parts: Void = sendSegments(segments, to: address, tid: tid, streams: streams, progress: progress)
+        for (entry, src) in items where !entry.dir && entry.split != true {
+            guard let src else { continue }
+            try await stream(src, offset: 0, length: entry.size, over: conn, name: entry.path, progress: progress)
         }
-        let r = try await conn.readFrame(Reply.self)
+        try await parts
+        let r = try await conn.readFrame(Reply.self, timeout: 120)
         guard r.ok else { throw PortalError.remote(r.error ?? "对方拒绝") }
         return r.name ?? address
+    }
+
+    private static func sendSegments(_ segments: [Segment], to address: String, tid: String, streams: Int,
+                                     progress: (@Sendable (Int64) -> Void)?) async throws {
+        guard !segments.isEmpty else { return }
+        let cfg = Store.shared.config
+        let queue = SegmentQueue(segments)
+        try await withThrowingTaskGroup(of: Void.self) { group in
+            for _ in 0..<min(streams, segments.count) {
+                group.addTask {
+                    let c = try await connect(address)
+                    defer { c.cancel() }
+                    while let s = await queue.next() {
+                        try await c.writeFrame(Header(key: cfg.key, from: computerName, kind: "part", text: s.path,
+                                                      size: s.length, tid: tid, offset: s.offset))
+                        try await stream(s.src, offset: s.offset, length: s.length, over: c, name: s.path, progress: progress)
+                        let r = try await c.readFrame(Reply.self, timeout: 120)
+                        guard r.ok else { throw PortalError.remote(r.error ?? "对方拒绝") }
+                    }
+                }
+            }
+            try await group.waitForAll()
+        }
+    }
+
+    private static func stream(_ src: URL, offset: Int64, length: Int64, over conn: NWConnection, name: String,
+                               progress: (@Sendable (Int64) -> Void)?) async throws {
+        let fh = try FileHandle(forReadingFrom: src)
+        defer { fh.closeFile() }
+        fh.seek(toFileOffset: UInt64(offset))
+        var remaining = length
+        while remaining > 0 {
+            let chunk = fh.readData(ofLength: Int(min(remaining, 1 << 20)))
+            guard !chunk.isEmpty else { throw PortalError.remote("\(name) 在发送过程中被改动了") }
+            try await conn.sendAsync(chunk)
+            remaining -= Int64(chunk.count)
+            progress?(Int64(chunk.count))
+        }
+    }
+}
+
+/// "1.2.0" >= "1.1.9"
+func versionAtLeast(_ v: String?, _ min: String) -> Bool {
+    guard let v else { return false }
+    let a = v.split(separator: ".").map { Int($0) ?? 0 }, b = min.split(separator: ".").map { Int($0) ?? 0 }
+    for i in 0..<max(a.count, b.count) {
+        let x = i < a.count ? a[i] : 0, y = i < b.count ? b[i] : 0
+        if x != y { return x > y }
+    }
+    return true
+}
+
+/// 多线程累加计数
+final class Counter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: Int64 = 0
+    func add(_ n: Int64) -> Int64 { lock.lock(); defer { lock.unlock() }; value += n; return value }
+}
+
+/// 限制刷新频率（多线程安全）
+final class Throttle: @unchecked Sendable {
+    private let lock = NSLock()
+    private var last = Date.distantPast
+    let interval: TimeInterval
+    init(_ interval: TimeInterval) { self.interval = interval }
+    func due() -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        guard Date().timeIntervalSince(last) >= interval else { return false }
+        last = Date()
+        return true
     }
 }

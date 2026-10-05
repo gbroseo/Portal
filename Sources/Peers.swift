@@ -77,7 +77,7 @@ enum Peers {
         let cfg = Store.shared.config
         var peer = Peer(address: address, label: label, name: nil, state: .offline)
         do {
-            let conn = try await Sender.connect(address, timeout: 3)
+            let conn = try await Sender.connect(address, timeout: 10)
             defer { conn.cancel() }
             try await conn.writeFrame(Header(key: cfg.key, from: computerName, kind: "ping"))
             let r = try await conn.readFrame(Reply.self)
@@ -99,7 +99,14 @@ enum Peers {
             all.append(c)
         }
         return await withTaskGroup(of: Peer.self) { group in
-            for c in all { group.addTask { await ping(c.address, label: c.label) } }
+            for c in all {
+                // 有长连接就说明在线，不用再 ping
+                if let l = Links.shared.linked(c.address) {
+                    group.addTask { Peer(address: c.address, label: c.label, name: l.name, state: .online, version: l.version) }
+                } else {
+                    group.addTask { await ping(c.address, label: c.label) }
+                }
+            }
             var result: [Peer] = []
             for await p in group { result.append(p) }
             return result.sorted { $0.display < $1.display }

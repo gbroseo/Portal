@@ -23,6 +23,8 @@ enum Clipboard {
         if types.contains(NSPasteboard.PasteboardType.fileURL.rawValue),
            let urls = pb.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL],
            !urls.isEmpty {
+            // UU 远程复制文件时放进剪贴板的占位文件（.uuremote_xxx），不是真文件，不同步
+            if urls.contains(where: { $0.lastPathComponent.hasPrefix(".uuremote") }) { return .none }
             return .files(urls)
         }
 
@@ -64,6 +66,26 @@ enum Clipboard {
         let pb = NSPasteboard.general
         pb.clearContents()
         pb.writeObjects(items)
+    }
+
+    /// 内容特征：文字看内容，图片看尺寸（别的软件转存时格式可能变，尺寸不会变）
+    static func signature(_ reps: [(Rep, Data)]) -> String? {
+        if let s = reps.first(where: { $0.0.type == NSPasteboard.PasteboardType.string.rawValue }),
+           let text = String(data: s.1, encoding: .utf8) {
+            return "t:" + text.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        if let img = reps.first(where: { $0.0.type == NSPasteboard.PasteboardType.png.rawValue || $0.0.type == NSPasteboard.PasteboardType.tiff.rawValue }),
+           let rep = NSBitmapImageRep(data: img.1) {
+            return "i:\(rep.pixelsWide)x\(rep.pixelsHigh)"
+        }
+        return nil
+    }
+
+    static func signature(_ urls: [URL]) -> String {
+        "f:" + urls.map { url -> String in
+            let size = (try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? NSNumber)?.int64Value ?? -1
+            return "\(url.lastPathComponent)#\(size)"
+        }.sorted().joined(separator: "|")
     }
 
     static func describe(_ reps: [(Rep, Data)]) -> String {

@@ -36,25 +36,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
         float.setVisible(!UserDefaults.standard.bool(forKey: "hideFloat"))
 
         server.onClip = { reps, from in
+            self.remember(Clipboard.signature(reps))
             Clipboard.apply(reps)
             self.markClipboardSeen()
-            HUD.show("📋 已收到 \(from) 的\(Clipboard.describe(reps))，可直接粘贴")
+            HUD.show("📋 已收到 \(from) 的\(Clipboard.describe(reps))，可直接粘贴", level: .clip)
         }
         server.onFiles = { urls, from, mode in
+            self.remember(Clipboard.signature(urls))
             Clipboard.applyFiles(urls)
             self.markClipboardSeen()
             let what = urls.count == 1 ? urls[0].lastPathComponent : "\(urls.count) 个文件"
-            HUD.show("📥 收到 \(from) 的 \(what)\n已放进「下载/传送门」，⌘V 可粘贴到任意文件夹", seconds: 4)
+            HUD.show("📥 收到 \(from) 的 \(what)\n已放进「下载/传送门」，⌘V 可粘贴到任意文件夹", seconds: 4,
+                     level: mode == "drop" ? .file : .clip)
             if mode == "drop" { NSWorkspace.shared.activateFileViewerSelecting(urls) }
         }
-        server.onProgress = { frac in self.showProgress(frac, receiving: true) }
+        server.onProgress = { st in self.showProgress(st, receiving: true) }
         Links.shared.server = server
         Links.shared.onChange = { self.refresh() }
         do { try server.start(port: Store.shared.config.port) } catch {
-            HUD.show("⚠️ 传送门启动失败：\(error.localizedDescription)", seconds: 6)
+            HUD.show("⚠️ 传送门启动失败：\(error.localizedDescription)", seconds: 6, level: .error)
         }
 
-        Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { _ in self.checkClipboard() }
+        Timer.scheduledTimer(withTimeInterval: 0.15, repeats: true) { _ in self.checkClipboard() }
         Timer.scheduledTimer(withTimeInterval: 20, repeats: true) { _ in self.refresh() }
         refresh()
         setupLoginItemOnce()
@@ -89,6 +92,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
 
     // MARK: - 剪贴板同步
 
+    /// 最近收到 / 发出的内容特征。UU 远程等软件也会同步剪贴板，会把刚收到的内容再写一遍，
+    /// 靠这个识别出来，避免又发回去（来回弹）。
+    private var recent: [(sig: String, at: Date)] = []
+
+    private func remember(_ sig: String?) {
+        guard let sig else { return }
+        recent.removeAll { Date().timeIntervalSince($0.at) > 60 }
+        recent.append((sig, Date()))
+    }
+
+    private func isEcho(_ sig: String?) -> Bool {
+        guard let sig else { return false }
+        return recent.contains { $0.sig == sig && Date().timeIntervalSince($0.at) < 60 }
+    }
+
     private func checkClipboard() {
         let pb = NSPasteboard.general
         let count = pb.changeCount
@@ -102,6 +120,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
         case .none:
             break
         case .reps(let reps):
+            let sig = Clipboard.signature(reps)
+            guard !isEcho(sig) else { return }
+            remember(sig)
             let targets = online
             Task.detached {
                 for p in targets {
@@ -110,17 +131,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
                 }
             }
         case .files(let urls):
+            let sig = Clipboard.signature(urls)
+            guard !isEcho(sig) else { return }
+            remember(sig)
             let limit = Int64(Store.shared.config.maxAutoFileMB) << 20
             let targets = online
             Task.detached {
                 let size = Sender.totalSize(urls)
                 if size > limit {
                     await MainActor.run {
-                        HUD.show("文件较大（\(formatBytes(size))），没有自动同步\n把它拖到屏幕边上的传送门小球上就能发送", seconds: 4)
+                        HUD.show("文件较大（\(formatBytes(size))），没有自动同步\n把它拖到传送门小球上就能发送", seconds: 4, level: .file)
                     }
                     return
                 }
-                await self.send(urls, to: targets, mode: "clip", quiet: size < 8 << 20)
+                await self.send(urls, to: targets, mode: "clip")
             }
         }
     }
@@ -132,25 +156,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
 
     // MARK: - 发送文件
 
-    func send(_ urls: [URL], to targets: [Peer], mode: String, quiet: Bool = false) async {
+    func send(_ urls: [URL], to targets: [Peer], mode: String) async {
         let size = Sender.totalSize(urls)
+        let name = urls.count == 1 ? urls[0].lastPathComponent : "\(urls.count) 个项目"
         let total = max(size * Int64(targets.count), 1)
-        var sent: Int64 = 0
-        var lastUI = Date.distantPast
-        await MainActor.run { transfers += 1; if !quiet { showProgress(0, receiving: false) } }
+        let counter = Counter()
+        let throttle = Throttle(0.25)
+        await MainActor.run { transfers += 1 }
         var ok: [String] = []
         var failed: [String] = []
         for p in targets {
             do {
-                let name = try await Sender.sendFiles(urls, to: p.address, mode: mode) { n in
-                    sent += n
-                    if !quiet, Date().timeIntervalSince(lastUI) > 0.3 {
-                        lastUI = Date()
-                        let frac = Double(sent) / Double(total)
-                        DispatchQueue.main.async { self.showProgress(frac, receiving: false) }
+                let peerName = try await Sender.sendFiles(urls, to: p.address, mode: mode, peerVersion: p.version) { n in
+                    let sent = counter.add(n)
+                    if size > 4 << 20, throttle.due() {
+                        let st = TransferStatus(receiving: false, name: name, done: sent, total: total)
+                        DispatchQueue.main.async { self.showProgress(st, receiving: false) }
                     }
                 }
-                ok.append(name)
+                ok.append(peerName)
             } catch {
                 log("发送到 \(p.display) 失败：\(error.localizedDescription)")
                 failed.append("\(p.display)（\(error.localizedDescription)）")
@@ -159,12 +183,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
         let ok2 = ok, failed2 = failed
         await MainActor.run {
             transfers -= 1
-            showProgress(nil, receiving: false)
+            if transfers == 0 { showProgress(nil, receiving: false) }
             if !failed2.isEmpty {
-                HUD.show("⚠️ 发送失败：\(failed2.joined(separator: "、"))", seconds: 5)
-            } else if !quiet || mode == "drop" {
-                let what = urls.count == 1 ? urls[0].lastPathComponent : "\(urls.count) 个项目"
-                HUD.show("✅ \(what)（\(formatBytes(size))）已发送到 \(ok2.joined(separator: "、"))")
+                HUD.show("⚠️ 发送失败：\(failed2.joined(separator: "、"))", seconds: 5, level: .error)
+            } else {
+                HUD.show("✅ \(name)（\(formatBytes(size))）已发送到 \(ok2.joined(separator: "、"))",
+                         level: mode == "drop" || size > 4 << 20 ? .file : .clip)
             }
         }
     }
@@ -173,7 +197,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
         let go = {
             let targets = self.online
             guard !targets.isEmpty else {
-                HUD.show("没有找到在线的电脑\n请确认另一台电脑开着传送门和 Tailscale", seconds: 4)
+                HUD.show("没有找到在线的电脑\n请确认另一台电脑开着传送门和 Tailscale", seconds: 4, level: .error)
                 return
             }
             Task.detached { await self.send(urls, to: targets, mode: "drop") }
@@ -181,14 +205,77 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
         if online.isEmpty { refresh(then: go) } else { go() }
     }
 
-    private func showProgress(_ frac: Double?, receiving: Bool) {
-        if let frac {
-            statusItem.button?.title = " \(receiving ? "↓" : "↑")\(Int(frac * 100))%"
-            float.progressText = "\(receiving ? "↓" : "↑")\(Int(frac * 100))%"
-        } else if transfers == 0 {
+    // MARK: - 进度显示
+
+    /// 每个方向一个：速度用滑动平均，算剩余时间
+    private struct Tracker {
+        var status: TransferStatus
+        var sampleBytes: Int64
+        var sampleTime: Date
+        var lastChange: Date
+        var speed: Double = 0
+    }
+    private var trackers: [Bool: Tracker] = [:]
+    private var progressTimer: Timer?
+
+    private func showProgress(_ s: TransferStatus?, receiving: Bool) {
+        guard let s else {
+            trackers[receiving] = nil
+            renderProgress()
+            return
+        }
+        let now = Date()
+        if var t = trackers[receiving], t.status.name == s.name {
+            if s.done != t.status.done { t.lastChange = now }
+            let dt = now.timeIntervalSince(t.sampleTime)
+            if dt >= 1 {
+                let inst = Double(s.done - t.sampleBytes) / dt
+                t.speed = t.speed == 0 ? inst : t.speed * 0.6 + inst * 0.4
+                t.sampleBytes = s.done
+                t.sampleTime = now
+            }
+            t.status = s
+            trackers[receiving] = t
+        } else {
+            trackers[receiving] = Tracker(status: s, sampleBytes: s.done, sampleTime: now, lastChange: now)
+        }
+        renderProgress()
+        // 网络卡住时进度不会再更新，定时刷新一下好显示「等待网络」
+        if progressTimer == nil {
+            progressTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in self.renderProgress() }
+        }
+    }
+
+    private func progressLine(_ t: Tracker, receiving: Bool) -> String {
+        let s = t.status
+        let pct = Int(Double(s.done) / Double(max(s.total, 1)) * 100)
+        let verb = receiving ? "正在接收" : "正在发送"
+        if Date().timeIntervalSince(t.lastChange) > 5 {
+            return "\(receiving ? "↓" : "↑") \(verb) \(s.name)  \(pct)% · 网络较慢，等待中…"
+        }
+        var line = "\(receiving ? "↓" : "↑") \(verb) \(s.name)  \(pct)%"
+        if t.speed > 0 {
+            line += " · \(formatBytes(Int64(t.speed)))/s"
+            let left = Double(s.total - s.done) / t.speed
+            line += " · 剩余约 " + (left < 60 ? "\(max(1, Int(left))) 秒" : "\(Int(left / 60) + 1) 分钟")
+        }
+        return line
+    }
+
+    private func renderProgress() {
+        guard let (dir, t) = trackers.first(where: { $0.key }) ?? trackers.first else {
             statusItem.button?.title = ""
             float.progressText = nil
+            float.toolTip = FloatingPortal.defaultTip
+            progressTimer?.invalidate()
+            progressTimer = nil
+            return
         }
+        let pct = Int(Double(t.status.done) / Double(max(t.status.total, 1)) * 100)
+        let short = "\(dir ? "↓" : "↑")\(pct)%"
+        statusItem.button?.title = " " + short
+        float.progressText = short
+        float.toolTip = progressLine(t, receiving: dir)
     }
 
     // MARK: - 拖放到菜单栏图标
@@ -219,6 +306,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
         menu.removeAllItems()
         let cfg = Store.shared.config
         menu.addItem(disabled("传送门 · 本机：\(computerName)"))
+        for (dir, t) in trackers.sorted(by: { $0.key && !$1.key }) {
+            menu.addItem(disabled(progressLine(t, receiving: dir)))
+        }
         menu.addItem(.separator())
 
         // 只显示有名字的离线设备（Tailscale 列表里的），记住的旧地址离线时不显示
@@ -242,6 +332,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
         menu.addItem(sync)
         menu.addItem(item("发送文件…", #selector(pickFiles)))
         menu.addItem(item("打开接收文件夹", #selector(openInbox)))
+        let notifyMenu = NSMenu()
+        for (key, title) in [("all", "全部提示（包括剪贴板同步）"), ("files", "只提示文件传输和错误"), ("off", "全部关闭")] {
+            let m = item(title, #selector(setNotify(_:)))
+            m.representedObject = key
+            m.state = cfg.notify == key ? .on : .off
+            notifyMenu.addItem(m)
+        }
+        let notifyItem = NSMenuItem(title: "提示消息", action: nil, keyEquivalent: "")
+        notifyItem.submenu = notifyMenu
+        menu.addItem(notifyItem)
         let ball = item("显示悬浮小球（拖文件到小球上发送）", #selector(toggleFloat))
         ball.state = UserDefaults.standard.bool(forKey: "hideFloat") ? .off : .on
         menu.addItem(ball)
@@ -291,6 +391,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
         panel.prompt = "发送"
         guard panel.runModal() == .OK else { return }
         sendInteractive(panel.urls)
+    }
+
+    @objc private func setNotify(_ sender: NSMenuItem) {
+        guard let key = sender.representedObject as? String else { return }
+        Store.shared.update { $0.notify = key }
     }
 
     @objc private func toggleFloat() {
@@ -366,10 +471,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
 
 /// 屏幕顶部的浮动提示，全屏（比如 UU 远程全屏）时也能看到。
 enum HUD {
+    /// clip：剪贴板同步（默认不提示）；file：文件传输；error：出错；always：用户自己点的操作
+    enum Level { case clip, file, error, always }
+
     private static var panel: NSPanel?
     private static var hideWork: DispatchWorkItem?
 
-    static func show(_ text: String, seconds: Double = 2.5) {
+    static func show(_ text: String, seconds: Double = 2.5, level: Level = .always) {
+        switch (Store.shared.config.notify, level) {
+        case (_, .always), ("all", _): break
+        case ("files", .file), ("files", .error): break
+        default: return
+        }
         hideWork?.cancel()
         panel?.orderOut(nil)
 

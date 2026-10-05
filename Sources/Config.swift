@@ -8,6 +8,8 @@ struct Config: Codable {
     var peers: [String] = []          // 手动添加的地址：host 或 host:port
     var learned: [String] = []        // 连接过并验证通过的电脑，自动记住
     var maxAutoFileMB = 200           // 复制文件时，超过这个大小就不自动同步
+    var streams = 4                   // 大文件并行连接数
+    var notify = "files"              // 提示消息：all 全部 / files 只提示文件传输和错误 / off 关闭
     var recvDir: String?
 
     init(key: String) { self.key = key }
@@ -20,6 +22,8 @@ struct Config: Codable {
         peers = try c.decodeIfPresent([String].self, forKey: .peers) ?? []
         learned = try c.decodeIfPresent([String].self, forKey: .learned) ?? []
         maxAutoFileMB = try c.decodeIfPresent(Int.self, forKey: .maxAutoFileMB) ?? 200
+        streams = try c.decodeIfPresent(Int.self, forKey: .streams) ?? 4
+        notify = try c.decodeIfPresent(String.self, forKey: .notify) ?? "files"
         recvDir = try c.decodeIfPresent(String.self, forKey: .recvDir)
     }
 
