@@ -15,6 +15,7 @@ struct Peer {
 enum Peers {
     private static let lock = NSLock()
     private static var trusted: Set<String> = []     // 同一 Tailscale 账号的设备 IP，免配对码
+    static var lastError: String?
 
     static func isTrusted(_ ip: String) -> Bool {
         lock.lock(); defer { lock.unlock() }
@@ -33,13 +34,20 @@ enum Peers {
         p.executableURL = URL(fileURLWithPath: cli)
         p.arguments = ["status", "--json"]
         let out = Pipe()
+        let errPipe = Pipe()
         p.standardOutput = out
-        p.standardError = FileHandle.nullDevice
-        do { try p.run() } catch { return [] }
+        p.standardError = errPipe
+        do { try p.run() } catch { lastError = "无法运行 \(cli)：\(error.localizedDescription)"; return [] }
         let data = out.fileHandleForReading.readDataToEndOfFile()
+        let errText = String(data: errPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
         p.waitUntilExit()
         guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let me = root["Self"] as? [String: Any] else { return [] }
+              let me = root["Self"] as? [String: Any] else {
+            let head = String(data: data.prefix(300), encoding: .utf8) ?? ""
+            lastError = "tailscale status 失败（退出码 \(p.terminationStatus)）：\(errText.prefix(300)) \(head)"
+            return []
+        }
+        lastError = nil
         let myUser = me["UserID"] as? Int
         var found: [(String, String)] = []
         var ips: Set<String> = []
@@ -53,6 +61,13 @@ enum Peers {
         }
         lock.lock(); trusted = ips; lock.unlock()
         return found
+    }
+
+    /// 记住验证通过的电脑（Tailscale 命令行不可用时也能互相找到）
+    static func learn(_ ip: String) {
+        guard !ip.hasPrefix("127."), ip != "::1", !Store.shared.config.learned.contains(ip) else { return }
+        Store.shared.update { $0.learned.append(ip) }
+        log("记住新电脑 \(ip)")
     }
 
     static func ping(_ address: String, label: String) async -> Peer {
@@ -70,8 +85,12 @@ enum Peers {
     }
 
     static func scan() async -> [Peer] {
-        let manual = Store.shared.config.peers.map { (address: $0, label: $0) }
-        let all = tailscalePeers() + manual
+        let cfg = Store.shared.config
+        var all: [(address: String, label: String)] = []
+        for c in tailscalePeers() + (cfg.peers + cfg.learned).map({ (address: $0, label: $0) })
+        where !all.contains(where: { $0.address == c.address }) {
+            all.append(c)
+        }
         return await withTaskGroup(of: Peer.self) { group in
             for c in all { group.addTask { await ping(c.address, label: c.label) } }
             var result: [Peer] = []

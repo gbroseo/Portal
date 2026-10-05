@@ -1,6 +1,6 @@
 import AppKit
 
-let cliCommands: Set<String> = ["send", "text", "peers", "key", "help", "-h", "--help"]
+let cliCommands: Set<String> = ["send", "text", "peers", "key", "diag", "help", "-h", "--help"]
 let arguments = Array(CommandLine.arguments.dropFirst())
 
 if let cmd = arguments.first, cliCommands.contains(cmd) {

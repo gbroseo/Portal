@@ -8,6 +8,8 @@ enum CLI {
       portal text <文字> [--to 电脑名]            把文字放进对方剪贴板
       portal peers                                列出能连上的电脑
       portal key [新配对码]                        查看 / 设置本机配对码
+      portal diag                                 诊断信息
+      （send / text 可加 --host IP 直接指定对方地址）
     """
 
     static func err(_ s: String) { FileHandle.standardError.write((s + "\n").data(using: .utf8)!) }
@@ -17,6 +19,11 @@ enum CLI {
         var filter: String?
         if let i = rest.firstIndex(of: "--to"), i + 1 < rest.count {
             filter = rest[i + 1].lowercased()
+            rest.removeSubrange(i...i + 1)
+        }
+        var host: String?
+        if let i = rest.firstIndex(of: "--host"), i + 1 < rest.count {
+            host = rest[i + 1]
             rest.removeSubrange(i...i + 1)
         }
 
@@ -45,7 +52,8 @@ enum CLI {
 
         case "send", "text":
             guard !rest.isEmpty else { err(usage); return 1 }
-            let targets = await Peers.scan().filter { p in
+            let candidates = host != nil ? [await Peers.ping(host!, label: host!)] : await Peers.scan()
+            let targets = candidates.filter { p in
                 p.state == .online && (filter == nil || [p.display, p.label, p.address].contains { $0.lowercased().contains(filter!) })
             }
             guard !targets.isEmpty else { err("没有找到在线的电脑（portal peers 查看）"); return 1 }
@@ -86,6 +94,19 @@ enum CLI {
                 }
             }
             return code
+
+        case "diag":
+            let cfg = Store.shared.config
+            let info = ProcessInfo.processInfo
+            print("电脑：\(computerName)  系统：\(info.operatingSystemVersionString)")
+            print("传送门：\(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") ?? "?")  端口：\(cfg.port)  配对码：\(cfg.key)")
+            print("手动地址：\(cfg.peers)  记住的电脑：\(cfg.learned)")
+            print("Tailscale 命令行：\(Peers.tailscaleCLI ?? "未找到")")
+            let ts = Peers.tailscalePeers()
+            print("Tailscale 同账号在线设备：\(ts.map { "\($0.label) \($0.address)" })")
+            if let e = Peers.lastError { print("Tailscale 错误：\(e)") }
+            for p in await Peers.scan() { print("连接测试：\(p.display) \(p.address) \(p.state)") }
+            return 0
 
         default:
             print(usage)

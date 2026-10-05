@@ -6,6 +6,7 @@ struct Config: Codable {
     var port: UInt16 = 47321
     var autoSync = true
     var peers: [String] = []          // 手动添加的地址：host 或 host:port
+    var learned: [String] = []        // 连接过并验证通过的电脑，自动记住
     var maxAutoFileMB = 200           // 复制文件时，超过这个大小就不自动同步
     var recvDir: String?
 
@@ -17,6 +18,7 @@ struct Config: Codable {
         port = try c.decodeIfPresent(UInt16.self, forKey: .port) ?? 47321
         autoSync = try c.decodeIfPresent(Bool.self, forKey: .autoSync) ?? true
         peers = try c.decodeIfPresent([String].self, forKey: .peers) ?? []
+        learned = try c.decodeIfPresent([String].self, forKey: .learned) ?? []
         maxAutoFileMB = try c.decodeIfPresent(Int.self, forKey: .maxAutoFileMB) ?? 200
         recvDir = try c.decodeIfPresent(String.self, forKey: .recvDir)
     }
@@ -67,18 +69,27 @@ final class Store {
     static let shared = Store()
     private let lock = NSLock()
     private var current = Config.load()
+    private var loadedAt = Store.modified()
 
+    private static func modified() -> Date? {
+        (try? FileManager.default.attributesOfItem(atPath: Config.file.path))?[.modificationDate] as? Date
+    }
+
+    /// 配置文件被命令行（portal key 等）改过时自动重新读取
     var config: Config {
         lock.lock(); defer { lock.unlock() }
+        let m = Store.modified()
+        if m != loadedAt { current = Config.load(); loadedAt = m }
         return current
     }
 
     func update(_ change: (inout Config) -> Void) {
         lock.lock()
+        if Store.modified() != loadedAt { current = Config.load() }
         change(&current)
-        let copy = current
+        current.save()
+        loadedAt = Store.modified()
         lock.unlock()
-        copy.save()
     }
 }
 

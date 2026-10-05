@@ -73,6 +73,7 @@ final class Server {
                 try await conn.writeFrame(Reply(ok: false, error: "配对码不一致", name: computerName))
                 return
             }
+            Peers.learn(ip)
             switch h.kind {
             case "ping":
                 try await conn.writeFrame(Reply(ok: true, name: computerName))
